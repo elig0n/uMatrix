@@ -1,0 +1,334 @@
+From 8b9e2ab4942d8259d551734a923531057a477892 Mon Sep 17 00:00:00 2001
+From: girst <girst@users.noreply.github.com>
+Date: Sun, 3 Nov 2019 00:00:23 +0100
+Subject: [PATCH 1/2] Keyboard Navigation inside the popup
+
+Use the cursor keys or hjkl to select cells in the matrix. Press Space
+or Return to toggle its color, Shift-Space or Shift-Return to make the
+current color explicit.
+More vi-like hotkeys are available to save (w) or revert (e/E) changes,
+reload (r/R), change scope(i/o, +/-) and toggle turning off uMatrix (q).
+
+To navigate only between the cells that are visible, a NodeIterator is
+used. This has the advantage that when additional rows are inserted
+(e.g. due to async XHR), NodeIterator automatically picks them up. A
+minor disadvantage is that once an iterator has been used up (i.e.
+nextNode() returns null), we need to create a new iterator and
+fast-forward it to the cell we were previously on (there is sadly no
+hasNext()-like functionality).
+createNodeIterator()'s acceptNode filter filters on cells by their
+common className and uses the node.offsetHeight trick to filter out
+those that are invisible due to an ancestor being hidden.
+---
+ src/css/popup.css |   4 ++
+ src/js/popup.js   | 140 +++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 143 insertions(+), 1 deletion(-)
+
+diff --git a/src/css/popup.css b/src/css/popup.css
+index bdf33093..dfa2b473 100644
+--- a/src/css/popup.css
++++ b/src/css/popup.css
+@@ -644,3 +644,7 @@ body.hConstrained {
+ body[data-touch="true"] .matCell {
+     line-height: 200%;
+     }
++.keyboardActive {
++    outline: 3px solid black;
++    z-index: 999;
++    }
+diff --git a/src/js/popup.js b/src/js/popup.js
+index b4d8e3fd..24227041 100644
+--- a/src/js/popup.js
++++ b/src/js/popup.js
+@@ -471,7 +471,8 @@ const getCellAction = function(hostname, type, leaning) {
+ 
+ const handleFilter = function(button, leaning) {
+     // our parent cell knows who we are
+-    const cell = button.ancestors('div.matCell');
++    const cell = (button.classList && button.classList.contains('matCell'))?
++            button : button.ancestors('div.matCell');
+     const expandos = expandosFromNode(cell);
+     const type = expandos.reqType;
+     const desHostname = expandos.hostname;
+@@ -1534,5 +1535,142 @@ uDom('#matList').on('click', '.g4Meta', function(ev) {
+ 
+ /******************************************************************************/
+ 
++let keyMap = {
++    'left':       ['h', 'ArrowLeft'],
++    'right':      ['l', 'ArrowRight'],
++    'up':         ['k', 'ArrowUp'],
++    'down':       ['j', 'ArrowDown'],
++    'select':     [' ', 'Enter'],
++    'reload':     ['r', 'R'], /* hold shift or ctrl to bypass cache */
++    'save':       ['w'],
++    'revert':     ['e'], /* in the style of vi's :e! */
++    'revert-all': ['E'],
++    'on-off':     ['q'],
++    'scope-out':  ['o', '-'],
++    'scope-in':   ['i', '+'],
++};
++
++let selectedCell = null;
++let nodeIterator = null;
++
++function setupKeyboard() {
++    if (getUserSetting('keyboardNavigation')) {
++        document.addEventListener('keydown', handleKeyboardInput);
++        document.addEventListener('click', (event) => {
++            /* remove the border if the user reverts to using the mouse */
++            if (selectedCell) selectedCell.classList.remove('keyboardActive');
++        });
++    }
++}
++
++document.addEventListener('keyup', (event) => {
++    let action = null;
++    for (let key in keyMap) {
++        if (keyMap[key].includes(event.key)) {
++            action = key;
++            if (action == 'select' && event.shiftKey)
++                action = 'select-inverse';
++            break;
++        }
++    }
++
++    switch (action) {
++    case 'up':             moveKeyboardCursor(-9); break;
++    case 'down':           moveKeyboardCursor(+9); break;
++    case 'left':           moveKeyboardCursor(-1); break;
++    case 'right':          moveKeyboardCursor(+1); break;
++    case 'select':         toggleViaKeyboard(selectedCell); break
++    case 'select-inverse': toggleViaKeyboard(selectedCell, true); break;
++    case 'revert':         revertMatrix(); break;
++    case 'revert-all':     revertAll(); break;
++    case 'save':           persistMatrix(); break;
++    case 'scope-out':      keyboardScope(+1); break;
++    case 'scope-in':       keyboardScope(-1); break;
++    case 'reload':
++        vAPI.messaging.send('default', {
++            what: 'forceReloadTab',
++            tabId: matrixSnapshot.tabId,
++            bypassCache: event.ctrlKey || event.shiftKey
++        });
++        break;
++    case 'on-off':
++        vAPI.messaging.send('popup.js', {
++            what: 'toggleMatrixSwitch',
++            switchName: 'matrix-off',
++            srcHostname: matrixSnapshot.scope
++        }, updateMatrixSnapshot);
++        break;
++    }
++
++    event.preventDefault();
++});
++
++function keyboardScope(direction) {
++    let hostname = matrixSnapshot.hostname.split('.');
++    let scope = matrixSnapshot.scope.split('.');
++    let begin = hostname.length - scope.length + direction;
++    if (begin < 0) return; // already at smallest scope
++    let newScope = hostname.slice(begin).join('.');
++    if (newScope == '') newScope = '*'; // global scope
++
++    let ev = new CustomEvent(
++        'uMatrixScopeWidgetChange',
++        {
++            detail: { scope: newScope }
++        }
++    );
++    window.dispatchEvent(ev);
++
++}
++
++function toggleViaKeyboard(node, doReverse = false) {
++    /* Note: normally, toggles colour. If doReverse, enforces current colour */
++    let expandos = expandosFromNode(node);
++    let hue = getTemporaryColor(expandos.hostname, expandos.reqType) & 0x03;
++    let action = (hue === Green ^ doReverse? 'blacklisting' : 'whitelisting');
++    handleFilter(node, action);
++}
++
++function moveKeyboardCursor(n) {
++    let previousCell = selectedCell;
++    if (selectedCell) {
++        selectedCell.classList.remove('keyboardActive');
++        selectedCell = advanceIterator(nodeIterator, n);
++    }
++
++    if(!selectedCell) { // Note: must check again in case we went off the matrix
++	[nodeIterator, selectedCell] = initNodeIterator(previousCell);
++    }
++
++    selectedCell.classList.add('keyboardActive');
++    selectedCell.scrollIntoView({'block': 'center'});
++}
++function advanceIterator(iterator, n) {
++    let operation = (n<0)? ()=>iterator.previousNode() : ()=>iterator.nextNode();
++    let [turns, direction] = [Math.abs(n), Math.sign(n)];
++    let newNode;
++
++    /* When backtracking, NodeIterator once returns the old node */
++    if (iterator.lastDirection != direction) turns++;
++    iterator.lastDirection = direction;
++
++    while (turns-- && (newNode = operation()));
++
++    return newNode;
++}
++
++function initNodeIterator(fastForwardTo = null) {
++    let newNode, iterator = document.createNodeIterator(document.body,
++        NodeFilter.SHOW_ELEMENT, {
++            acceptNode: (node) =>
++                node.classList.contains('matCell') && node.offsetHeight ?
++                    NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
++        }
++    );
++    while ((newNode = iterator.nextNode()) != fastForwardTo && fastForwardTo);
++    iterator.lastDirection = 1;
++    return [iterator, newNode];
++}
++
+ // <<<<< end of local scope
+ }
+
+From 5eda5826f85e31119656e88e1794f077fe37cd55 Mon Sep 17 00:00:00 2001
+From: girst <girst@users.noreply.github.com>
+Date: Sun, 10 Nov 2019 15:20:30 +0100
+Subject: [PATCH 2/2] Document popup keyboard bindings and allow disabling them
+
+---
+ src/_locales/de/messages.json | 9 +++++++++
+ src/_locales/en/messages.json | 8 ++++++++
+ src/js/background.js          | 1 +
+ src/js/messaging.js           | 3 ++-
+ src/js/popup.js               | 5 +++--
+ src/js/settings.js            | 1 +
+ src/settings.html             | 5 +++++
+ 7 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/src/_locales/de/messages.json b/src/_locales/de/messages.json
+index 19802e4d..740b9069 100644
+--- a/src/_locales/de/messages.json
++++ b/src/_locales/de/messages.json
+@@ -451,6 +451,15 @@
+         "message": "Anzeige für farbenblinde Benutzer",
+         "description": ""
+     },
++    "settingsMatrixkeyboardNavigation" : {
++        "message": "Tastatur-Navigation",
++        "description": ""
++    },
++    "settingsMatrixkeyboardNavigationHelp" : {
++        "message": "Auswählen von Matrixzellen mit den Cursortasten oder vi(1)-ähnlichen Belegungen\n\n<b>␣</b>, <b>⏎</b>: Zelle umschalten\n<b>q</b>: Matrix deaktivieren/aktivieren\n<b>w</b>: Änderungen speichern\n<b>e</b>: Änderungen verwerfen (⇧: global)\n<b>r</b>: Seite neu laden (⇧: ohne Cache)\n<b>–</b>/<b>+</b>: Scope erweitern/verengen",
++
++        "description": ""
++    },
+     "settingsMatrixConvenienceHeader": {
+         "message": "Komforteinstellungen",
+         "description": "English: Convenience"
+diff --git a/src/_locales/en/messages.json b/src/_locales/en/messages.json
+index 317f6bce..bc2c9dfa 100644
+--- a/src/_locales/en/messages.json
++++ b/src/_locales/en/messages.json
+@@ -456,6 +456,14 @@
+         "message": "Color-blind friendly",
+         "description": ""
+     },
++    "settingsMatrixkeyboardNavigation" : {
++        "message": "Keyboard navigation",
++        "description": ""
++    },
++    "settingsMatrixkeyboardNavigationHelp" : {
++        "message": "Navigate between matrix cells using the cursor keys or vi(1) style keybindings.\n\n<b>␣</b>, <b>⏎</b>: toggle cell\n<b>q</b>: disable/enable matrix\n<b>w</b>: save changes\n<b>e</b>: revert changes (⇧: all)\n<b>r</b>: reload page (⇧: no cache)\n<b>–</b>/<b>+</b>: wider/narrower scope",
++        "description": ""
++    },
+     "settingsMatrixConvenienceHeader" : {
+         "message": "Convenience",
+         "description": "English: Convenience"
+diff --git a/src/js/background.js b/src/js/background.js
+index 3fc2a910..6d392634 100644
+--- a/src/js/background.js
++++ b/src/js/background.js
+@@ -151,6 +151,7 @@ return {
+         externalHostsFiles: [],
+         externalRecipeFiles: [],
+         iconBadgeEnabled: true,
++        keyboardNavigation: false,
+         noTooltips: false,
+         popupCollapseAllDomains: false,
+         popupCollapseBlacklistedDomains: false,
+diff --git a/src/js/messaging.js b/src/js/messaging.js
+index a1fe1fdd..f1382a01 100644
+--- a/src/js/messaging.js
++++ b/src/js/messaging.js
+@@ -260,7 +260,8 @@ const matrixSnapshotFromPage = function(pageStore, details) {
+             colorBlindFriendly: µmuser.colorBlindFriendly,
+             displayTextSize: µmuser.displayTextSize,
+             noTooltips: µmuser.noTooltips,
+-            popupScopeLevel: µmuser.popupScopeLevel
++            popupScopeLevel: µmuser.popupScopeLevel,
++            keyboardNavigation: µmuser.keyboardNavigation
+         }
+     };
+ 
+diff --git a/src/js/popup.js b/src/js/popup.js
+index 24227041..5cc688da 100644
+--- a/src/js/popup.js
++++ b/src/js/popup.js
+@@ -1370,6 +1370,7 @@ const onMatrixSnapshotReady = function(response) {
+     // Now that tabId and pageURL are set, we can build our menu
+     initMenuEnvironment();
+     makeMenu();
++    setupKeyboard();
+ 
+     // After popup menu is built, check whether there is a non-empty matrix
+     if ( matrixSnapshot.url === '' ) {
+@@ -1563,7 +1564,7 @@ function setupKeyboard() {
+     }
+ }
+ 
+-document.addEventListener('keyup', (event) => {
++function handleKeyboardInput(event) {
+     let action = null;
+     for (let key in keyMap) {
+         if (keyMap[key].includes(event.key)) {
+@@ -1603,7 +1604,7 @@ document.addEventListener('keyup', (event) => {
+     }
+ 
+     event.preventDefault();
+-});
++}
+ 
+ function keyboardScope(direction) {
+     let hostname = matrixSnapshot.hostname.split('.');
+diff --git a/src/js/settings.js b/src/js/settings.js
+index 93cd259d..271e7cce 100644
+--- a/src/js/settings.js
++++ b/src/js/settings.js
+@@ -104,6 +104,7 @@ const onInputChanged = function(ev) {
+     case 'iconBadgeEnabled':
+     case 'noTooltips':
+     case 'processHyperlinkAuditing':
++    case 'keyboardNavigation':
+         changeUserSettings(target.id, target.checked);
+         break;
+     case 'noMixedContent':
+diff --git a/src/settings.html b/src/settings.html
+index 9725e8db..e5846112 100644
+--- a/src/settings.html
++++ b/src/settings.html
+@@ -61,6 +61,11 @@ <h3 data-i18n="settingsMatrixDisplayHeader"></h3>
+     <li>
+         <input id="colorBlindFriendly" type="checkbox" data-setting-bool>
+         <label data-i18n="settingsMatrixDisplayColorBlind" for="colorBlindFriendly"></label>
++    <li>
++        <input id="keyboardNavigation" type="checkbox" data-setting-bool>
++        <label data-i18n="settingsMatrixkeyboardNavigation" for="keyboardNavigation"></label>
++        <span class="fa-icon whatisthis">question-circle</span>
++        <div class="whatisthis-expandable para" data-i18n="settingsMatrixkeyboardNavigationHelp"></div>
+ </ul>
+ <h3 data-i18n="privacyPageName"></h3>
+ <ul>
